@@ -38,7 +38,7 @@ public class LightweightDAGSchedulerTest {
         Map<String, List<String>> dag = new HashMap<>();
         dag.put("A", Arrays.asList());
         dag.put("B", Arrays.asList("A"));
-        dag.put("C", Arrays.asList("B"));
+        dag.put("C", Arrays.asList("A"));
 
         // 创建任务执行顺序记录器
         List<String> executionOrder = Collections.synchronizedList(new ArrayList<>());

@@ -13,27 +13,71 @@ import java.util.concurrent.locks.*;
  * 2. Barrier对齐：算子等待所有输入的barrier到达后才进行快照
  * 3. 数据缓冲：对齐期间缓冲barrier之后的数据
  * 4. 状态快照：算子状态的一致性快照
- * 5. 超时回滚：任何算子超时导致整个checkpoint失败并自动回滚
+ * 5. 超时回滚：任何算子超时导致整个checkpoint失败
  * 6. 故障恢复：从最近的完整checkpoint恢复状态
  */
-public class CompleteCheckpointSystem {
+public class CompleteCheckpointSystemOld {
 
     // ==================== 核心接口定义 ====================
 
+    /**
+     * 可检查点的算子接口
+     */
     public interface CheckpointableOperator {
+        /**
+         * 获取算子ID
+         */
         String getOperatorId();
+
+        /**
+         * 获取上游算子ID列表
+         */
         List<String> getUpstreamOperatorIds();
+
+        /**
+         * 处理数据元素
+         */
         void processElement(Object element);
+
+        /**
+         * 接收barrier
+         * @param checkpointId 检查点ID
+         * @param sourceOperatorId 发送barrier的算子ID
+         */
         void receiveBarrier(long checkpointId, String sourceOperatorId);
+
+        /**
+         * 快照当前状态
+         * @param checkpointId 检查点ID
+         * @return 快照完成的Future
+         */
         CompletableFuture<Void> snapshotState(long checkpointId);
+
+        /**
+         * 从检查点恢复状态
+         * @param checkpointId 检查点ID
+         */
         void restoreState(long checkpointId);
     }
 
+    /**
+     * 状态后端接口（用于状态持久化）
+     */
     public interface StateBackend {
+        /**
+         * 保存算子状态
+         */
         CompletableFuture<Void> saveState(long checkpointId, String operatorId, Object state);
+
+        /**
+         * 加载算子状态
+         */
         CompletableFuture<Object> loadState(long checkpointId, String operatorId);
     }
 
+    /**
+     * 内存状态后端（简化实现）
+     */
     public static class MemoryStateBackend implements StateBackend {
         private final Map<String, Object> storage = new ConcurrentHashMap<>();
 
@@ -45,7 +89,8 @@ public class CompleteCheckpointSystem {
         public CompletableFuture<Void> saveState(long checkpointId, String operatorId, Object state) {
             return CompletableFuture.runAsync(() -> {
                 storage.put(getKey(checkpointId, operatorId), state);
-                System.out.println("  [状态后端] 保存状态: checkpoint=" + checkpointId + ", operator=" + operatorId);
+                System.out.println("保存状态: checkpoint=" + checkpointId +
+                                 ", operator=" + operatorId);
             });
         }
 
@@ -53,8 +98,9 @@ public class CompleteCheckpointSystem {
         public CompletableFuture<Object> loadState(long checkpointId, String operatorId) {
             return CompletableFuture.supplyAsync(() -> {
                 Object state = storage.get(getKey(checkpointId, operatorId));
-                System.out.println("  [状态后端] 加载状态: checkpoint=" + checkpointId +
-                        ", operator=" + operatorId + ", state=" + (state != null ? "存在" : "null"));
+                System.out.println("加载状态: checkpoint=" + checkpointId +
+                                 ", operator=" + operatorId +
+                                 ", state=" + (state != null ? "存在" : "null"));
                 return state;
             });
         }
@@ -62,17 +108,26 @@ public class CompleteCheckpointSystem {
 
     // ==================== Checkpoint协调器 ====================
 
+    /**
+     * CheckpointCoordinator - 管理barrier对齐和checkpoint生命周期
+     */
     public static class CheckpointCoordinator {
         private final AtomicLong checkpointIdCounter = new AtomicLong(0);
         private final Map<String, CheckpointableOperator> operators = new ConcurrentHashMap<>();
-        protected final StateBackend stateBackend;
+        private final StateBackend stateBackend;
 
+        // Checkpoint元数据存储
         private final Map<Long, CheckpointMetadata> checkpoints = new ConcurrentHashMap<>();
+
+        // Barrier对齐状态：checkpointId -> operatorId -> 已接收的barrier集合
         private final Map<Long, Map<String, Set<String>>> barrierStates = new ConcurrentHashMap<>();
 
+        // 执行服务
         private final ScheduledExecutorService timeoutExecutor;
         private final ExecutorService taskExecutor;
         private final long checkpointTimeoutMs;
+
+        // 同步锁
         private final ReentrantLock coordinatorLock = new ReentrantLock();
 
         public CheckpointCoordinator(long checkpointTimeoutMs, int poolSize) {
@@ -89,29 +144,41 @@ public class CompleteCheckpointSystem {
             this.timeoutExecutor = Executors.newScheduledThreadPool(2);
         }
 
+        /**
+         * 注册算子
+         */
         public void registerOperator(CheckpointableOperator operator) {
             operators.put(operator.getOperatorId(), operator);
         }
 
+        /**
+         * 触发新的checkpoint
+         * @return checkpoint ID
+         */
         public long triggerCheckpoint() {
             long checkpointId = checkpointIdCounter.incrementAndGet();
 
             coordinatorLock.lock();
             try {
+                // 创建checkpoint元数据
                 CheckpointMetadata metadata = new CheckpointMetadata(checkpointId, operators.size());
+                checkpoints.put(checkpointId, metadata);
 
+                // 将所有算子添加到待完成列表
                 for (CheckpointableOperator op : operators.values()) {
                     metadata.addPendingOperator(op.getOperatorId());
                 }
 
                 checkpoints.put(checkpointId, metadata);
 
+                // 初始化barrier状态
                 Map<String, Set<String>> barrierState = new ConcurrentHashMap<>();
                 for (CheckpointableOperator op : operators.values()) {
                     barrierState.put(op.getOperatorId(), ConcurrentHashMap.newKeySet());
                 }
                 barrierStates.put(checkpointId, barrierState);
 
+                // 从源头算子（无上游）开始发送barrier
                 for (CheckpointableOperator op : operators.values()) {
                     if (op.getUpstreamOperatorIds().isEmpty()) {
                         taskExecutor.submit(() -> {
@@ -124,10 +191,11 @@ public class CompleteCheckpointSystem {
                     }
                 }
 
+                // 设置超时检查
                 timeoutExecutor.schedule(() -> checkCheckpointTimeout(checkpointId),
-                        checkpointTimeoutMs, TimeUnit.MILLISECONDS);
+                                        checkpointTimeoutMs, TimeUnit.MILLISECONDS);
 
-                System.out.println("[协调器] 触发checkpoint: " + checkpointId);
+                System.out.println("触发checkpoint: " + checkpointId);
                 return checkpointId;
 
             } finally {
@@ -135,21 +203,26 @@ public class CompleteCheckpointSystem {
             }
         }
 
+        /**
+         * 处理算子接收到的barrier
+         */
         public void handleBarrierReceived(long checkpointId, String operatorId, String sourceId) {
             coordinatorLock.lock();
             try {
                 Map<String, Set<String>> barrierState = barrierStates.get(checkpointId);
                 if (barrierState == null) {
-                    return;
+                    return; // checkpoint可能已被取消
                 }
 
                 Set<String> receivedBarriers = barrierState.get(operatorId);
                 if (receivedBarriers == null) {
-                    return;
+                    return; // 算子未注册
                 }
 
+                // 记录接收到的barrier
                 receivedBarriers.add(sourceId);
 
+                // 获取算子的所有上游算子
                 CheckpointableOperator operator = operators.get(operatorId);
                 if (operator == null) {
                     return;
@@ -157,7 +230,9 @@ public class CompleteCheckpointSystem {
 
                 List<String> upstreamIds = operator.getUpstreamOperatorIds();
 
+                // 检查是否所有上游的barrier都已到达
                 if (receivedBarriers.containsAll(upstreamIds)) {
+                    // Barrier对齐完成，触发状态快照
                     triggerOperatorSnapshot(checkpointId, operatorId);
                 }
 
@@ -166,6 +241,9 @@ public class CompleteCheckpointSystem {
             }
         }
 
+        /**
+         * 触发算子状态快照
+         */
         private void triggerOperatorSnapshot(long checkpointId, String operatorId) {
             CheckpointableOperator operator = operators.get(operatorId);
             if (operator == null) {
@@ -176,14 +254,15 @@ public class CompleteCheckpointSystem {
                 try {
                     CompletableFuture<Void> snapshotFuture = operator.snapshotState(checkpointId);
 
+                    // 设置超时
                     snapshotFuture.orTimeout(checkpointTimeoutMs / 2, TimeUnit.MILLISECONDS)
-                            .thenAccept(v -> {
-                                handleSnapshotComplete(checkpointId, operatorId);
-                            })
-                            .exceptionally(ex -> {
-                                handleSnapshotFailed(checkpointId, operatorId, ex);
-                                return null;
-                            });
+                                 .thenAccept(v -> {
+                                     handleSnapshotComplete(checkpointId, operatorId);
+                                 })
+                                 .exceptionally(ex -> {
+                                     handleSnapshotFailed(checkpointId, operatorId, ex);
+                                     return null;
+                                 });
 
                 } catch (Exception e) {
                     handleSnapshotFailed(checkpointId, operatorId, e);
@@ -191,6 +270,9 @@ public class CompleteCheckpointSystem {
             });
         }
 
+        /**
+         * 处理快照完成
+         */
         private void handleSnapshotComplete(long checkpointId, String operatorId) {
             coordinatorLock.lock();
             try {
@@ -199,6 +281,7 @@ public class CompleteCheckpointSystem {
                     return;
                 }
 
+                // 标记算子快照完成
                 metadata.completeOperator(operatorId);
 
                 if (metadata.isComplete()) {
@@ -210,12 +293,16 @@ public class CompleteCheckpointSystem {
             }
         }
 
+        /**
+         * 处理快照失败
+         */
         private void handleSnapshotFailed(long checkpointId, String operatorId, Throwable cause) {
             coordinatorLock.lock();
             try {
                 CheckpointMetadata metadata = checkpoints.get(checkpointId);
                 if (metadata != null && metadata.getStatus() == CheckpointStatus.IN_PROGRESS) {
-                    failCheckpoint(checkpointId, "算子 " + operatorId + " 快照失败: " + cause.getMessage());
+                    failCheckpoint(checkpointId,
+                        "算子 " + operatorId + " 快照失败: " + cause.getMessage());
                 }
 
             } finally {
@@ -223,12 +310,16 @@ public class CompleteCheckpointSystem {
             }
         }
 
+        /**
+         * 处理算子错误
+         */
         private void handleOperatorError(long checkpointId, String operatorId, Throwable cause) {
             coordinatorLock.lock();
             try {
                 CheckpointMetadata metadata = checkpoints.get(checkpointId);
                 if (metadata != null && metadata.getStatus() == CheckpointStatus.IN_PROGRESS) {
-                    failCheckpoint(checkpointId, "算子 " + operatorId + " 错误: " + cause.getMessage());
+                    failCheckpoint(checkpointId,
+                        "算子 " + operatorId + " 错误: " + cause.getMessage());
                 }
 
             } finally {
@@ -236,6 +327,9 @@ public class CompleteCheckpointSystem {
             }
         }
 
+        /**
+         * 完成checkpoint
+         */
         private void completeCheckpoint(long checkpointId) {
             CheckpointMetadata metadata = checkpoints.get(checkpointId);
             if (metadata == null) {
@@ -245,12 +339,16 @@ public class CompleteCheckpointSystem {
             metadata.setStatus(CheckpointStatus.COMPLETED);
             metadata.setEndTime(System.currentTimeMillis());
 
+            // 清理状态
             barrierStates.remove(checkpointId);
 
-            System.out.println("[协调器] Checkpoint " + checkpointId + " 完成, 耗时: " +
-                    (metadata.getEndTime() - metadata.getStartTime()) + "ms");
+            System.out.println("Checkpoint " + checkpointId + " 完成, 耗时: " +
+                             (metadata.getEndTime() - metadata.getStartTime()) + "ms");
         }
 
+        /**
+         * 失败checkpoint
+         */
         private void failCheckpoint(long checkpointId, String reason) {
             CheckpointMetadata metadata = checkpoints.get(checkpointId);
             if (metadata == null) {
@@ -260,28 +358,15 @@ public class CompleteCheckpointSystem {
             metadata.setStatus(CheckpointStatus.FAILED);
             metadata.setEndTime(System.currentTimeMillis());
 
+            // 清理状态
             barrierStates.remove(checkpointId);
 
-            System.err.println("[协调器] Checkpoint " + checkpointId + " 失败: " + reason);
-
-            rollbackToPreviousCheckpoint(checkpointId);
+            System.err.println("Checkpoint " + checkpointId + " 失败: " + reason);
         }
 
-        private void rollbackToPreviousCheckpoint(long failedCheckpointId) {
-            Long previousCheckpointId = getLatestCompletedCheckpointId();
-            if (previousCheckpointId != null && previousCheckpointId < failedCheckpointId) {
-                System.out.println("[协调器] 触发回滚: 从checkpoint " + previousCheckpointId +
-                        " 恢复（checkpoint " + failedCheckpointId + " 失败）");
-                try {
-                    restoreFromCheckpoint(previousCheckpointId);
-                } catch (Exception e) {
-                    System.err.println("[协调器] 回滚失败: " + e.getMessage());
-                }
-            } else {
-                System.out.println("[协调器] 无有效的checkpoint可回滚");
-            }
-        }
-
+        /**
+         * 检查checkpoint超时
+         */
         private void checkCheckpointTimeout(long checkpointId) {
             coordinatorLock.lock();
             try {
@@ -290,7 +375,7 @@ public class CompleteCheckpointSystem {
                     long elapsed = System.currentTimeMillis() - metadata.getStartTime();
                     if (elapsed > checkpointTimeoutMs) {
                         failCheckpoint(checkpointId, "超时 (" + elapsed + "ms > " +
-                                checkpointTimeoutMs + "ms)");
+                                                     checkpointTimeoutMs + "ms)");
                     }
                 }
 
@@ -299,6 +384,9 @@ public class CompleteCheckpointSystem {
             }
         }
 
+        /**
+         * 从checkpoint恢复状态
+         */
         public void restoreFromCheckpoint(long checkpointId) throws Exception {
             coordinatorLock.lock();
             try {
@@ -311,6 +399,7 @@ public class CompleteCheckpointSystem {
                     throw new IllegalStateException("Checkpoint未完成: " + checkpointId);
                 }
 
+                // 恢复所有算子状态
                 List<CompletableFuture<Void>> restoreFutures = new ArrayList<>();
 
                 for (CheckpointableOperator operator : operators.values()) {
@@ -325,24 +414,31 @@ public class CompleteCheckpointSystem {
                     restoreFutures.add(future);
                 }
 
+                // 等待所有算子恢复完成
                 CompletableFuture.allOf(restoreFutures.toArray(new CompletableFuture[0]))
-                        .get(checkpointTimeoutMs, TimeUnit.MILLISECONDS);
+                               .get(checkpointTimeoutMs, TimeUnit.MILLISECONDS);
 
-                System.out.println("[协调器] 从Checkpoint " + checkpointId + " 恢复成功");
+                System.out.println("从Checkpoint " + checkpointId + " 恢复成功");
 
             } finally {
                 coordinatorLock.unlock();
             }
         }
 
+        /**
+         * 获取最近的完整checkpoint ID
+         */
         public Long getLatestCompletedCheckpointId() {
             return checkpoints.entrySet().stream()
-                    .filter(entry -> entry.getValue().getStatus() == CheckpointStatus.COMPLETED)
-                    .map(Map.Entry::getKey)
-                    .max(Long::compareTo)
-                    .orElse(null);
+                .filter(entry -> entry.getValue().getStatus() == CheckpointStatus.COMPLETED)
+                .map(Map.Entry::getKey)
+                .max(Long::compareTo)
+                .orElse(null);
         }
 
+        /**
+         * 优雅关闭
+         */
         public void shutdown() {
             timeoutExecutor.shutdown();
             taskExecutor.shutdown();
@@ -364,6 +460,9 @@ public class CompleteCheckpointSystem {
 
     // ==================== 辅助类 ====================
 
+    /**
+     * Checkpoint元数据
+     */
     public static class CheckpointMetadata {
         private final long checkpointId;
         private final long startTime;
@@ -378,10 +477,6 @@ public class CompleteCheckpointSystem {
             this.status = CheckpointStatus.IN_PROGRESS;
             this.pendingOperators = ConcurrentHashMap.newKeySet();
             this.completedCount = new AtomicInteger(0);
-        }
-
-        public void addPendingOperator(String operatorId) {
-            pendingOperators.add(operatorId);
         }
 
         public void completeOperator(String operatorId) {
@@ -401,27 +496,37 @@ public class CompleteCheckpointSystem {
         public long getStartTime() { return startTime; }
         public long getEndTime() { return endTime; }
         public CheckpointStatus getStatus() { return status; }
+        public void addPendingOperator(String operatorId) {
+            pendingOperators.add(operatorId);
+        }
 
         public void setEndTime(long endTime) { this.endTime = endTime; }
         public void setStatus(CheckpointStatus status) { this.status = status; }
     }
 
+    /**
+     * Checkpoint状态枚举
+     */
     public enum CheckpointStatus {
         IN_PROGRESS, COMPLETED, FAILED
     }
 
     // ==================== 基础算子实现 ====================
 
+    /**
+     * 抽象基础算子，提供Exactly-Once支持
+     */
     public static abstract class BaseOperator implements CheckpointableOperator {
         protected final String operatorId;
         protected final List<String> upstreamOperatorIds;
         protected CheckpointCoordinator coordinator;
-        protected StateBackend stateBackend;
-        protected List<CheckpointableOperator> downstreamOperators = new CopyOnWriteArrayList<>();
 
+        // Exactly-Once支持
         protected final Queue<Object> buffer = new ConcurrentLinkedQueue<>();
         protected volatile boolean checkpointInProgress = false;
         protected volatile long currentCheckpointId = -1;
+
+        // 算子状态
         protected volatile Object state;
 
         public BaseOperator(String operatorId, List<String> upstreamOperatorIds) {
@@ -431,11 +536,6 @@ public class CompleteCheckpointSystem {
 
         public void setCoordinator(CheckpointCoordinator coordinator) {
             this.coordinator = coordinator;
-            this.stateBackend = coordinator.stateBackend;
-        }
-
-        public void addDownstreamOperator(CheckpointableOperator downstream) {
-            this.downstreamOperators.add(downstream);
         }
 
         @Override
@@ -451,12 +551,17 @@ public class CompleteCheckpointSystem {
         @Override
         public void processElement(Object element) {
             if (checkpointInProgress) {
+                // Checkpoint进行中，缓冲数据
                 buffer.offer(element);
             } else {
+                // 正常处理
                 processElementInternal(element);
             }
         }
 
+        /**
+         * 内部元素处理（由子类实现）
+         */
         protected abstract void processElementInternal(Object element);
 
         @Override
@@ -465,6 +570,7 @@ public class CompleteCheckpointSystem {
                 coordinator.handleBarrierReceived(checkpointId, operatorId, sourceOperatorId);
             }
 
+            // 开始checkpoint，缓冲后续数据
             checkpointInProgress = true;
             currentCheckpointId = checkpointId;
         }
@@ -473,14 +579,11 @@ public class CompleteCheckpointSystem {
         public CompletableFuture<Void> snapshotState(long checkpointId) {
             return CompletableFuture.runAsync(() -> {
                 try {
-                    Map<String, Object> stateSnapshot = captureState();
-                    stateBackend.saveState(checkpointId, operatorId, stateSnapshot).join();
-
+                    // 执行状态快照
                     performSnapshot(checkpointId);
 
+                    // 恢复处理缓冲的数据
                     resumeProcessing();
-
-                    forwardBarrier(checkpointId);
 
                 } catch (Exception e) {
                     throw new CompletionException(e);
@@ -488,19 +591,14 @@ public class CompleteCheckpointSystem {
             });
         }
 
-        protected abstract Map<String, Object> captureState() throws Exception;
+        /**
+         * 执行状态快照（由子类实现）
+         */
         protected abstract void performSnapshot(long checkpointId) throws Exception;
 
-        private void forwardBarrier(long checkpointId) {
-            if (!downstreamOperators.isEmpty()) {
-                System.out.println("  [" + operatorId + "] 向下游 " + downstreamOperators.size() +
-                        " 个算子发送barrier");
-                for (CheckpointableOperator downstream : downstreamOperators) {
-                    downstream.receiveBarrier(checkpointId, operatorId);
-                }
-            }
-        }
-
+        /**
+         * 恢复处理缓冲的数据
+         */
         private void resumeProcessing() {
             checkpointInProgress = false;
             currentCheckpointId = -1;
@@ -515,25 +613,8 @@ public class CompleteCheckpointSystem {
 
         @Override
         public void restoreState(long checkpointId) {
-            System.out.println("  [" + operatorId + "] 从checkpoint " + checkpointId + " 恢复状态");
-
-            try {
-                Object loadedState = stateBackend.loadState(checkpointId, operatorId).get(
-                        2000, TimeUnit.MILLISECONDS
-                );
-
-                if (loadedState != null && loadedState instanceof Map) {
-                    Map<String, Object> stateMap = (Map<String, Object>) loadedState;
-                    restoreFromState(stateMap);
-                    System.out.println("  [" + operatorId + "] 状态恢复完成: " + stateMap);
-                }
-            } catch (Exception e) {
-                System.err.println("  [" + operatorId + "] 状态恢复失败: " + e.getMessage());
-                throw new RuntimeException("状态恢复失败", e);
-            }
+            System.out.println(operatorId + " 从checkpoint " + checkpointId + " 恢复状态");
         }
-
-        protected abstract void restoreFromState(Map<String, Object> state) throws Exception;
 
         public Object getState() {
             return state;
@@ -546,6 +627,9 @@ public class CompleteCheckpointSystem {
 
     // ==================== 示例算子 ====================
 
+    /**
+     * 简单状态算子示例
+     */
     public static class SimpleOperator extends BaseOperator {
         private int processedCount = 0;
 
@@ -556,31 +640,21 @@ public class CompleteCheckpointSystem {
         @Override
         protected void processElementInternal(Object element) {
             processedCount++;
-            System.out.println("  [" + operatorId + "] 处理元素 #" + processedCount + ": " + element);
-        }
-
-        @Override
-        protected Map<String, Object> captureState() throws Exception {
-            Map<String, Object> snapshot = new HashMap<>();
-            snapshot.put("processedCount", processedCount);
-            snapshot.put("timestamp", System.currentTimeMillis());
-            return snapshot;
+            System.out.println(operatorId + " 处理元素 #" + processedCount + ": " + element);
         }
 
         @Override
         protected void performSnapshot(long checkpointId) throws Exception {
-            Thread.sleep(100);
-            System.out.println("  [" + operatorId + "] 快照checkpoint " + checkpointId +
-                    ", 已处理: " + processedCount);
-        }
+            // 模拟快照操作
+            Map<String, Object> snapshot = new HashMap<>();
+            snapshot.put("processedCount", processedCount);
+            snapshot.put("timestamp", System.currentTimeMillis());
 
-        @Override
-        protected void restoreFromState(Map<String, Object> state) throws Exception {
-            Integer count = (Integer) state.get("processedCount");
-            if (count != null) {
-                this.processedCount = count;
-                System.out.println("  [" + operatorId + "] 恢复到处理数量: " + processedCount);
-            }
+            // 模拟快照耗时
+            Thread.sleep(100);
+
+            System.out.println(operatorId + " 快照checkpoint " + checkpointId +
+                             ", 已处理: " + processedCount);
         }
     }
 
@@ -589,84 +663,83 @@ public class CompleteCheckpointSystem {
     public static void main(String[] args) throws Exception {
         System.out.println("=== 类Flink Checkpoint系统测试 ===\n");
 
+        // 创建协调器
         CheckpointCoordinator coordinator = new CheckpointCoordinator(4000, 4);
 
+        // 创建算子（简单的线性拓扑：source -> map -> sink）
         BaseOperator source = new SimpleOperator("source", Arrays.asList());
         BaseOperator map = new SimpleOperator("map", Arrays.asList("source"));
         BaseOperator sink = new SimpleOperator("sink", Arrays.asList("map"));
 
+        // 设置协调器
         source.setCoordinator(coordinator);
         map.setCoordinator(coordinator);
         sink.setCoordinator(coordinator);
 
-        // 建立上下游关系
-        source.addDownstreamOperator(map);
-        map.addDownstreamOperator(sink);
-
+        // 注册算子
         coordinator.registerOperator(source);
         coordinator.registerOperator(map);
         coordinator.registerOperator(sink);
 
         try {
-            System.out.println("【测试1】正常checkpoint流程");
-            System.out.println("-----------------------------------");
+            System.out.println("测试1: 正常checkpoint流程");
+
+            // 触发checkpoint
             long checkpointId1 = coordinator.triggerCheckpoint();
+
+            // 等待checkpoint完成
             Thread.sleep(1500);
 
-            System.out.println("\n【测试2】模拟数据处理");
-            System.out.println("-----------------------------------");
+            System.out.println("\n测试2: 模拟数据处理");
+
+            // 模拟数据处理
             for (int i = 1; i <= 5; i++) {
                 source.processElement("data-" + i);
                 Thread.sleep(100);
             }
 
-            System.out.println("\n【测试3】触发第二个checkpoint");
-            System.out.println("-----------------------------------");
+            System.out.println("\n测试3: 触发第二个checkpoint");
+
             long checkpointId2 = coordinator.triggerCheckpoint();
             Thread.sleep(1500);
 
-            System.out.println("\n【测试4】故障恢复测试");
-            System.out.println("-----------------------------------");
+            System.out.println("\n测试4: 故障恢复测试");
+
             Long latestCheckpoint = coordinator.getLatestCompletedCheckpointId();
             if (latestCheckpoint != null) {
-                System.out.println("找到最新完成的checkpoint: " + latestCheckpoint);
                 coordinator.restoreFromCheckpoint(latestCheckpoint);
             }
+            System.out.println("\n测试5: 超时测试");
 
-            System.out.println("\n【测试5】超时测试 - 添加慢速算子");
-            System.out.println("-----------------------------------");
+            // 创建一个会超时的算子
             BaseOperator slowOperator = new BaseOperator("slow", Arrays.asList()) {
                 @Override
                 protected void processElementInternal(Object element) {}
 
                 @Override
-                protected Map<String, Object> captureState() throws Exception {
-                    return new HashMap<>();
-                }
-
-                @Override
                 protected void performSnapshot(long checkpointId) throws Exception {
-                    System.out.println("  [slow] 开始快照（将耗时5秒，会超时）...");
+                    // 模拟慢速快照，会超时
                     Thread.sleep(5000);
-                    System.out.println("  [slow] 快照完成（这行不应该出现）");
-                }
-
-                @Override
-                protected void restoreFromState(Map<String, Object> state) throws Exception {
                 }
             };
 
             slowOperator.setCoordinator(coordinator);
             coordinator.registerOperator(slowOperator);
 
-            long checkpointId3 = coordinator.triggerCheckpoint();
-            System.out.println("等待checkpoint " + checkpointId3 + " 超时...");
-            Thread.sleep(5000);
+            // Deleted:long checkpointId3 = coordinator.triggerCheckpoint();
+            // Deleted:Thread.sleep(3500); // 等待超时发生
 
+            // 重新触发checkpoint，这次会包含slowOperator
+            long checkpointId3 = coordinator.triggerCheckpoint();
+
+            // 等待足够长的时间让超时检测生效（超过3秒但小于5秒）
+            Thread.sleep(4000);
+
+            // 验证checkpoint状态
             Long latestCompleted = coordinator.getLatestCompletedCheckpointId();
-            System.out.println("\n最终结果:");
-            System.out.println("  最新完成的checkpoint: " + latestCompleted);
-            System.out.println("  checkpoint " + checkpointId3 + " 状态: 应该已失败并触发回滚");
+            System.out.println("最新完成的checkpoint: " + latestCompleted);
+            System.out.println("预期结果: checkpointId3=" + checkpointId3 + " 应该失败（超时）");
+
 
         } finally {
             coordinator.shutdown();

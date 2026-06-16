@@ -1,7 +1,8 @@
 package com.liuyanglouis.slidingwindow.idgenerator;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * 优化的分布式ID生成器（类似Snowflake算法）
@@ -438,7 +439,7 @@ public class OptimizedDistributedIdGenerator {
         System.out.println("\n--- 测试4：并发测试 ---");
         int threadCount = 10;
         int idsPerThread = 10000;
-        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        java.util.concurrent.ExecutorService executor = Executors.newFixedThreadPool(threadCount);
         CountDownLatch latch = new CountDownLatch(threadCount);
         AtomicLong totalIds = new AtomicLong(0);
         AtomicLong errorCount = new AtomicLong(0);
