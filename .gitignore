@@ -1,0 +1,48 @@
+# Maven build output
+target/
+out/
+build/
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+.vscode/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+logs/
+
+# Compiled class files
+*.class
+
+# Package files
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Virtual machine crash logs
+hs_err_pid*
+
+# Maven wrapper
+.mvn/
+mvnw
+mvnw.cmd
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

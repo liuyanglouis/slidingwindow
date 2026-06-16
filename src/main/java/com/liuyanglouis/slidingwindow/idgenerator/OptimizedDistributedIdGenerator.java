@@ -1,3 +1,5 @@
+package com.liuyanglouis.slidingwindow.idgenerator;
+
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
